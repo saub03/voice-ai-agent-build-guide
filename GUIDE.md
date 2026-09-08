@@ -5,6 +5,7 @@
 - **뼈대(메커니즘)** — `template/s0_* ~ s6_*` … 재사용. 노트북의 셀 순서와 거의 1:1 대응.
 - **도메인(데이터)** — `template/s1_domain.py` … **당신이 채워야 할 유일한 곳**. 아래 §3-도메인 지도를 보면서 채우세요.
 - **앱** — `app/server.py` (FastAPI + 브라우저 콘솔) … 도메인을 채우면 즉시 실행되는 참조 구현.
+- **완성 예제** — `example-project/` … 템플릿을 **택배/배송 고객센터 도메인으로 직접 채운 참고 구현**. §4를 따라 만들어진 결과물이라, "내가 만들 프로젝트"의 비교 대상으로 씁니다.
 
 ---
 
@@ -48,12 +49,14 @@
 
 ## 2. 시작 (5분)
 
+> 요구사항: **Python 3.10+** (타입 애너테이션 `X | None` 사용). 템플릿의 뼈대는 이미 만들어져 있고, **도메인만 채우면** 전부 돈다. 완성본을 먼저 보고 시작하고 싶다면 `example-project/`(택배/배송 도메인)를 참고하세요.
+
 ```bash
-# 1) 복사
-cp -r voice-ai-agent-template my-voice-agent && cd my-voice-agent
+# 1) 복사 (실제 템플릿 디렉토리명은 template/)
+cp -r template my-voice-agent && cd my-voice-agent
 
 # 2) 의존성 (mock 최소: numpy, jsonschema)
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 3) 도메인 채우기: template/s1_domain.py 편집 (§3 지도와 슬롯 주석 참고)
@@ -66,6 +69,9 @@ cd app && python server.py    # → http://localhost:8000
 
 도메인을 채우지 않아도 템플릿 코드는 import·자체검증이 모두 돈다(스모크 1부). 채운 뒤엔
 회귀 게이트·예약 여정·지표가 실제 도는지 스모크 2부(메모리 채움 도메인)로 확인된다.
+
+> 💡 템플릿을 복사하지 않고 이 저장소에서 바로 스모크를 돌려보려면:
+> `python tests/test_smoke.py` (루트 템플릿은 도메인이 빈 기본 상태라 '미채움 안내' 1부 + 메모리 주입 2부가 돈다)
 
 ---
 
@@ -90,7 +96,8 @@ cd app && python server.py    # → http://localhost:8000
   - `s1_asr.py` — ASREngine 계약 + MockWhisper + 환각 필터 + 후처리 사전
 - 종료 게이트:
   - 골드 6/n 전부 `rule_intent == gold` (assert)
-  - 우선순위: "급해요 + billing" → P2 (한 단계만), "급해요 + security" → P1 (승격 없음)
+  - 우선순위: "급해요 + 일반(P3)" → P2 (한 단계만), "급해요 + 최상위(P1)" → P1 (승격 없음)
+    (example-project 는 "급해요 + track" → P2, "택배 사기 신고" → P1)
   - 변형 문의로 규칙의 한계를 **눈으로 확인** (5/6 놓침이 정상)
 - 근거 셀: 7~13, 15
 
@@ -119,6 +126,7 @@ cd app && python server.py    # → http://localhost:8000
 ### [4단계] 서빙 — FastAPI + 브라우저 콘솔
 - 목표: 전화 상담을 HTTP API 로. `app/server.py` 단일 파일 참조 구현.
 - 채울 도메인: `MockASR.transcribe` 의 데모 캔드 스크립트(시드와 맞추기) — 비워 둬도 서버는 뜬다.
+  (example-project 에서는 이 캔드 스크립트를 **시드에 맞게 활성화**해 두었다 — [5단계]와 함께 원샷 데모가 된다.)
 - 메커니즘: TTL 세션 저장소 · sess-인자 도구 · DB_LOCK 동시성 · `/api/session`·`/api/text-turn`·`/api/audio-turn`·`/api/health`
 - 종료 게이트 (계약 검증):
   - 없는 세션 → **404** (조용히 새 세션 만들기 금지)
@@ -148,13 +156,24 @@ cd app && python server.py    # → http://localhost:8000
 
 ### 4.0 프로젝트 초기화
 ```bash
-# 작업공간 루트에서
-cp -r voice-ai-agent-template my-voice-agent
+# 작업공간 루트에서 (실제 템플릿 디렉토리명은 template/)
+cp -r template my-voice-agent
 cd my-voice-agent
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate     # Python 3.10+
 pip install -r requirements.txt
 # 도메인 채우기 전 스모크 (모든 메커니즘 import/자체검증이 돈다)
 python tests/test_smoke.py
+```
+
+> **완성본이 궁금하다면?** `example-project/` 가 템플릿을 그대로 복사해 **택배/배송 고객센터** 도메인으로 채운 결과물입니다. 아래 4.1~4.5를 이 저장소 안에서 따라하면서 `example-project/`와 diff 를 떠 비교하면 "내가 어떻게 채웠는가"가 바로 보입니다.
+
+example-project 도메인 위에서 전부 돈다는 확인:
+```bash
+cd example-project
+source .venv/bin/activate
+python tests/test_smoke.py            # 택배 도메인 end-to-end
+python -m template.s3_regression_gates
+python -m template.s6_checklist
 ```
 
 ### 4.1 도메인 정의 — s1_domain.py 채우기
@@ -172,6 +191,16 @@ python tests/test_smoke.py
 7. **DOMAIN_LEXICON** — ASR 오인식 → 표준 표기.
 
 채우는 동안 `python tests/test_smoke.py` 를 반복 실행해 **남은 빈칸이 없어지는 것**을 확인한다.
+
+> **⚠️ 도메인을 바꿀 때 s1_domain.py 밖에서 반드시 함께 손봐야 할 곳** (자주 놓치므로 여기에 모아 둔다):
+> 1. `template/s3_agent.py` 의 `BOOKING_SERVICE` — 행동 시뮬레이터가 가정하는 **booking 서비스명**. `SEED_SERVICES`의 booking 이름과 일치시킬 것 (example-project 는 "기사 방문").
+> 2. `app/server.py` 의 `MockAgent.BOOKING_SERVICE` — 자동으로 `SEED_SERVICES`에서 뽑지만, booking 이 없으면 `""`가 되므로 booking 서비스는 반드시 시드에 둘 것.
+> 3. `app/server.py` 의 `MockASR.transcribe` — 4단계 데모용 '캔드 스크립트'(시드의 고객·서비스명과 맞춰야 한다).
+> 4. `app/server.py` 의 `MockAgent.agent_step` 내 '내일/모레' 상대 날짜·'해주세요' 확정 문구·booking 서비스명 — 도메인에 맞게 조절.
+> 5. `app/server.py` `_open` 의 활성 상한(`open_cnt >= 3`) — `template/s3_policy.MAX_OPEN_PER_CUSTOMER` 와 맞춘다.
+> 6. `template/s5_metrics.py` 의 `HIGH_RISK` — "놓치면 안 되는" 문의(최상위 인텐트 원형 + 규칙이 놓칠 변형)를 넣어 재현율 계약을 살린다.
+>
+> 도메인 특정 단어는 `s1_domain.py` **한 곳**에만 모여 있어야 한다. `template/` 메커니즘 파일에 도메인 이름이 하드코딩돼 있으면(위 1·3·4 같은 곳) 그것들이 전부 "바꿔야 할 지점"이다.
 
 ### 4.2 벽돌 크기의 스텝 — 1단계 먼저
 가장 작은 도메인(인텐트 2~3개)으로 시작해 `s1_classifier`, `s1_callflow` 의 selfcheck 를 통과시킨 뒤
@@ -191,6 +220,11 @@ python -m template.s6_checklist
 cd app && python server.py   # http://localhost:8000
 ```
 마이크 녹음(MediaRecorder → `/api/audio-turn`)과 텍스트 fallback(`/api/text-turn`)을 모두 제공한다.
+`/api/text-turn` 을 `curl` 로 테스트할 땐 한글은 반드시 `--data-urlencode` 로 보낸다.
+
+example-project(택배) 데모 시나리오 — `MockASR` 캔드 스크립트가 시드와 맞으므로
+"김하나 1985-05-12 이고요 내일 기사 방문 예약하고 싶어요" 를 한 턴만 보내면
+본인확인 → 슬롯 조회 → (10시 선택) 접수까지 이어진다.
 
 ### 4.5 주의: 날짜는 오늘 기준
 시드는 **'오늘' 기준으로 계산**(D0/D1/D2)되며 날짜 하드코딩을 금지한다. `s3_db.rel_dates(today)` 처럼
@@ -322,6 +356,7 @@ for uid, text in HIGH_RISK:              # template/s5_metrics
 python -m template.s6_checklist    # 점검표 + 메커니즘 재확인
 python tests/test_smoke.py         # 도메인 미채움 포함 전체 스모크
 ```
+채운 도메인(예: `example-project/`)에서는 기본값이 전부 ✅ 로 충족되고, 회귀 게이트도 실제로 돈다.
 
 ---
 
@@ -351,6 +386,12 @@ python tests/test_smoke.py         # 도메인 미채움 포함 전체 스모크
 | `tests/test_smoke.py` | 전체 | 스모크 재현 | — |
 
 *("셀 n"의 n 은 노트북의 execution_count 와 대응; 4·5단계의 일부 셀은 미실행이어서 번호가 없어 설명으로 대체.)*
+
+위 표의 "대응 병원/헬프데스크"는 이 가이드가 정리될 때 참고한 진행 가이드 도메인들이다. 같은 표는 **example-project(택배/배송)** 에서도 그대로 성립한다 — 이 저장소에서 바로 대조해 볼 수 있다:
+
+- `example-project/template/s1_domain.py` = §4.1 의 7개 슬롯을 **택배 인텐트**(track/claim/redirect/booking/security)로 채운 완성본
+- 실측값: 골드 정확도 100% · 3중 관문 차단 5 (형식/스키마/논리 결함 전부 🛑) · 회귀 게이트 10종 ✅ · 점검표 12/12 ✅ · 규칙 고위험 재현율 50% (변형이 만들어낸 계약의 간극 → 실물 LLM 몫, §5)
+- `example-project/tests/test_smoke.py` = "빈 골격 + 메모리 주입"인 루트 템플릿 스모크와 달리, **채운 도메인 위에서** end-to-end 로 돈다.
 
 ## 부록 B — 선택 설비 (REAL 전용, mock 때엔 불필요)
 

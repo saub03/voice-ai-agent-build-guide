@@ -1,0 +1,9 @@
+# example-project 런타임 산출물 / 로컬 환경 — 커밋하지 않는다
+.venv/
+app/app.db
+guide.db
+app/tmp_upload.webm
+__pycache__/
+*.pyc
+models/
+.env
