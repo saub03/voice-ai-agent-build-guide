@@ -4,7 +4,8 @@ from __future__ import annotations
 # ── 이 파일의 위치 ─────────────────────────────────────────────────────────
 #   template/s3_* 모듈(전역 SESSION·단일 커넥션)을 '세션 별 상태 + DB 락 동시성'으로
 #   재배선한 단일 파일 참조 구현입니다. 노트북 진행 가이드 [4단계]와 동작이 같습니다.
-#   - sess 를 첫 인자로 받는 도구(세션=신원) · DB_LOCK(동시성) · TTL 세션 · mock ASR/TTS
+#   - sess 를 첫 인자로 받는 도구(세션=신원) · DB_LOCK(동시성) · TTL 세션
+#   - 실물 엔진 기본: mlx-whisper(ASR) · sherpa-onnx Supertonic(TTS) · Ollama qwen(LLM). mock 은 주석
 #   - 도메인 시드(고객/서비스/슬롯)는 template/s1_domain 을 사용
 #
 #   ⚠️ 실행 전에 template/s1_domain.py 를 채워야 합니다. (미채움 시 메시지와 함께 종료)
@@ -15,7 +16,7 @@ import io
 import json
 import os
 import sqlite3
-import subprocess  # noqa: F401  ([REAL] ASR 연결 시 ffmpeg 변환용)
+import subprocess  # (실물 ASR: webm → 16k mono wav 변환용)
 import threading
 import time
 import uuid
@@ -25,11 +26,26 @@ from pathlib import Path
 
 import numpy as np
 
-# ── 템플릿 도메인 로드 (시드만 사용) ──
+# ── 템플릿 공통 모듈 ──
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from template import s1_domain as domain  # noqa: E402
+from template import s1_asr as asr_contract  # noqa: E402  (환각 필터 · 한글 후처리)
+from template import s0_audio_contract as audio_contract  # noqa: E402  (16k·mono·f32 규격화)
+
+# ── .env 로드 (AIGC_* 환경변수) — 없어도 기본값으로 동작 ──
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # python-dotenv 미설치 시 환경변수만 사용
+    pass
+
+# ── [REAL] 실물 엔진 라이브러리 ──
+import sherpa_onnx
+import mlx_whisper
+from openai import OpenAI
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "app.db"
@@ -118,30 +134,87 @@ def reset_db_state() -> sqlite3.Connection:
         conn.commit()
 
 
-# ── 엔진 (mock 기본, real 은 주석/가이드로 스위치) ──
-class MockASR:
-    name = "mock-asr"
+# ── 실물 엔진 (mlx-whisper / sherpa-onnx) — [REAL] 기본 ─────────────────────
+class RealASR:
+    name = "mlx-whisper"
 
     def transcribe(self, wav_path: Path) -> str:
-        # [도메인] 데모용 '캔드 스크립트' — 실제 마이크 녹음을 mock 으로 대체한다.
-        # 도메인 기준 예시: 택배/배송 — SEED_CUSTOMERS/SEED_SERVICES 와 맞추면 동작한다.
-        booked = next((n for n, k in domain.SEED_SERVICES if k == "booking"), "기사 방문")
-        return f"김하나 1985-05-12 이고요 내일 {booked} 예약하고 싶어요"
+        # wav_path: ffmpeg 로 만든 16k·mono·wav 여야 한다 (audio-turn 에서 변환)
+        r = mlx_whisper.transcribe(
+            str(wav_path),
+            path_or_hf_repo=os.getenv("AIGC_ASR_MODEL",
+                                      "mlx-community/whisper-large-v3-turbo"),
+            language="ko",
+        )
+        text = (r["text"] or "").strip()
+        if asr_contract.is_hallucination(text):
+            return ""
+        return asr_contract.postprocess_ko(text)
 
 
-class MockTTS:
-    name = "mock-tts"
+class RealTTS:
+    name = "supertonic"
+
+    def __init__(self) -> None:
+        self._tts = None
+
+    def _load(self) -> None:
+        d = Path(__file__).resolve().parent.parent / "models" / os.getenv(
+            "AIGC_TTS_SUPERTONIC", "sherpa-onnx-supertonic-3-tts-int8-2026-05-11")
+        if not d.exists():
+            raise RuntimeError(
+                f"Supertonic TTS 모델이 없습니다: {d}\n"
+                "GUIDE.md §5.3 의 GitHub release 를 다운로드해 models/ 에 풀어 주세요.")
+        def p(name: str) -> str:
+            return str(d / name)
+        st = sherpa_onnx.OfflineTtsSupertonicModelConfig(
+            duration_predictor=p("duration_predictor.int8.onnx"),
+            text_encoder=p("text_encoder.int8.onnx"),
+            vector_estimator=p("vector_estimator.int8.onnx"),
+            vocoder=p("vocoder.int8.onnx"),
+            tts_json=p("tts.json"),
+            unicode_indexer=p("unicode_indexer.bin"),
+            voice_style=p("voice.bin"),
+        )
+        self._tts = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(supertonic=st, provider="cpu")))
 
     def __call__(self, text: str) -> tuple[np.ndarray, int]:
-        sr = 16000
-        dur = 0.16 * len(text) + 0.4
-        t = np.arange(int(sr * dur)) / sr
-        y = (0.1 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
-        return y, sr
+        if self._tts is None:
+            self._load()
+        g = sherpa_onnx.GenerationConfig()
+        g.sid, g.speed, g.extra["lang"] = 0, 1.0, "ko"
+        out = self._tts.generate(text, g)
+        return np.asarray(out.samples, dtype=np.float32), int(out.sample_rate)
 
 
-ASR = MockASR()
-TTS = MockTTS()
+ASR = RealASR()
+TTS = RealTTS()
+
+# ── mock 엔진 (예전 기본값 · 이제는 비활성) ─────────────────────────────────
+# class MockASR:
+#     name = "mock-asr"
+#
+#     def transcribe(self, wav_path: Path) -> str:
+#         # [도메인] 데모용 '캔드 스크립트' — 실제 마이크 녹음을 mock 으로 대체한다.
+#         # 도메인 기준 예시: 택배/배송 — SEED_CUSTOMERS/SEED_SERVICES 와 맞추면 동작한다.
+#         booked = next((n for n, k in domain.SEED_SERVICES if k == "booking"), "기사 방문")
+#         return f"김하나 1985-05-12 이고요 내일 {booked} 예약하고 싶어요"
+#
+#
+# class MockTTS:
+#     name = "mock-tts"
+#
+#     def __call__(self, text: str) -> tuple[np.ndarray, int]:
+#         sr = 16000
+#         dur = 0.16 * len(text) + 0.4
+#         t = np.arange(int(sr * dur)) / sr
+#         y = (0.1 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+#         return y, sr
+#
+#
+# ASR = MockASR()
+# TTS = MockTTS()
 
 # ── 도구 (sess 를 첫 인자로!) — 노트북 3단계 도구의 '세션' 이식 ──
 def _verify(sess: Session, name: str, birth_date: str) -> dict:
@@ -277,45 +350,151 @@ def _execute_tool(sess: Session, name: str, args: dict) -> dict:
         return {"error": "bad_arguments", "message": f"{type(e).__name__}: {e}"}
 
 
-# ── 행동 시뮬레이터 (mock LLM) — 노트북 3단계 MockAgentLLM 을 sess 로 이식 (참조 구현) ──
-class MockAgent:
-    # [도메인] booking 서비스명 — SEED_SERVICES 의 booking 이름과 일치해야 함
-    BOOKING_SERVICE = next((n for n, k in domain.SEED_SERVICES if k == "booking"), "")
+# ── 실물 에이전트 — Ollama qwen (OpenAI 호환 API) ────────────────────────────
+#   도구 루프는 GUIDE §5.4 주의사항대로 'auto + 왕복 루프'로 자체 수행한다.
+#   - SYSTEM_PROMPT 에 '오늘 날짜'를 반드시 주입 (날짜 환각 방지, GUIDE T2)
+#   - 반환은 서버 _agent_turn 계약: {"content", "tool_log"} — tool_log 는 UI 로그용
+_TOOL_DESCRIPTIONS = {
+    "verify_customer": "고객 본인 확인 — name(이름), birth_date(YYYY-MM-DD)",
+    "list_services": "제공 서비스 목록 조회",
+    "get_available_slots": "예약 가능 슬롯 조회 — service(서비스명), date(YYYY-MM-DD, 반드시 오늘 날짜 기준으로 산정)",
+    "open_case": "케이스 개설 — service(서비스명), summary(요청 내용), slot_id(booking 시 고른 슬롯)",
+    "list_cases": "내 케이스/예약 목록 조회",
+    "cancel_case": "케이스 취소 — case_id(정수)",
+}
+
+
+def _tool_schemas() -> list[dict]:
+    props = {
+        "verify_customer": {"name": {"type": "string"}, "birth_date": {"type": "string"}},
+        "list_services": {},
+        "get_available_slots": {"service": {"type": "string"}, "date": {"type": "string"}},
+        "open_case": {"service": {"type": "string"}, "summary": {"type": "string"},
+                      "slot_id": {"type": "integer"}},
+        "list_cases": {},
+        "cancel_case": {"case_id": {"type": "integer"}},
+    }
+    required = {
+        "verify_customer": ["name", "birth_date"],
+        "get_available_slots": ["service", "date"],
+        "open_case": ["service", "summary"],
+        "cancel_case": ["case_id"],
+    }
+    return [{"type": "function", "function": {
+                "name": name, "description": desc,
+                "parameters": {"type": "object", "properties": props.get(name, {}),
+                               "required": required.get(name, [])}}}
+            for name, desc in _TOOL_DESCRIPTIONS.items()]
+
+
+class RealAgent:
+    """Ollama qwen 실물 에이전트 — 세션 별 채팅 메시지를 자체 보관하고,
+    도구는 auto 왕복 루프(서버 _execute_tool 재사용)로 완성한다."""
+
+    MAX_TOOL_TURNS = 6        # GUIDE T10 — 무한 도구 왕복 방지
+
+    def __init__(self) -> None:
+        self.model = os.getenv("AIGC_LLM_MODEL", "qwen2.5:32b")
+        self.client = OpenAI(base_url=os.getenv(
+            "AIGC_LLM_BASE_URL", "http://localhost:11434/v1"), api_key="ollama")
+        self.chats: dict[str, list[dict]] = {}
+        today = datetime.now().date().isoformat()
+        catalog = " · ".join(f"{n}({('예약' if k == 'booking' else '접수')})"
+                             for n, k in domain.SEED_SERVICES)
+        self.system = (
+            "당신은 택배/배송 고객상담센터의 음성 상담원입니다. "
+            f"오늘 날짜는 {today} 입니다. 날짜는 반드시 이 값만 사용하세요.\n"
+            f"서비스 카탈로그(정확한 이름만 사용): {catalog}\n"
+            "규칙:\n"
+            "1) verify_customer(이름+생년월일) 로 본인 확인을 먼저 한 뒤 업무를 진행한다.\n"
+            "2) 예약(booking)은 get_available_slots(service, date) 로 슬롯을 조회하고, "
+            "고객이 고른 시간의 slot_id 로 open_case(service, summary, slot_id)를 연다.\n"
+            "3) 조회는 list_cases, 취소는 cancel_case(case_id) 를 쓴다.\n"
+            "4) 도구 결과만 근거로 최종 안내를 한국어로 2~3문장 이내로 간결하게 한다.\n"
+            "5) 이번 응답에서 도구가 필요하면 함께 호출하고, 결과를 기다린 뒤 최종 응답한다.\n"
+            "6) 서비스명이 확실하지 않으면 list_services 로 확인한다."
+        )
 
     def agent_step(self, sess: Session, text: str, history: list) -> dict:
-        import re
-        ids = re.search(r"([가-힣]{2,4})\s*(\d{4}-\d{2}-\d{2})", text)
-        if not sess.verified:
-            if ids:
-                return {"tool_calls": [("verify_customer",
-                                        {"name": ids.group(1), "birth_date": ids.group(2)})]}
-            return {"content": "본인 확인을 위해 성함과 생년월일을 말씀해 주세요."}
-        if "취소" in text:
-            if sess.meta["did_cancel"]:
-                return {"content": "이미 취소되었습니다."}
-            if sess.meta["last_case_id"]:
-                return {"tool_calls": [("cancel_case", {"case_id": sess.meta["last_case_id"]})]}
-            return {"tool_calls": [("list_cases", {})]}
-        if ("내일" in text or "모레" in text) and not sess.meta["last_slots"]:
-            d = "모레" if "모레" in text else "내일"
-            date_str = (datetime.now().date() + timedelta(days=2 if d == "모레" else 1)).isoformat()
-            return {"tool_calls": [("get_available_slots",
-                                    {"service": self.BOOKING_SERVICE, "date": date_str})]}
-        if any(w in text for w in ("조회", "내 예약", "내 케이스", "보여줘")):
-            if sess.meta["listed_done"]:
-                return {"content": "조회 결과는 이미 안내해 드렸습니다."}
-            return {"tool_calls": [("list_cases", {})]}
-        m = re.search(r"(\d{1,2})\s*시", text)
-        if sess.meta["last_slots"] and not sess.meta["did_open"] and ("해주세요" in text or m):
-            slot = next((s for s in sess.meta["last_slots"]
-                         if m and s["time"].startswith(f"{int(m.group(1)):02d}")),
-                        sess.meta["last_slots"][0])
-            return {"tool_calls": [("open_case", {"service": self.BOOKING_SERVICE,
-                                                  "summary": text, "slot_id": slot["slot_id"]})]}
-        return {"content": "네, 그렇게 도와드릴게요."}
+        sid = sess.sid
+        conv = self.chats.setdefault(sid, [{"role": "system", "content": self.system}])
+        conv.append({"role": "user", "content": text})
+        tool_log: list[dict] = []
+        for _ in range(self.MAX_TOOL_TURNS):
+            r = self.client.chat.completions.create(
+                model=self.model, messages=conv, tools=_tool_schemas(), temperature=0.0)
+            msg = r.choices[0].message
+            calls = getattr(msg, "tool_calls", None)
+            if not calls:
+                answer = (getattr(msg, "content", None) or "네.").strip()
+                conv.append({"role": "assistant", "content": answer})
+                self._prune()
+                return {"content": answer, "tool_log": tool_log}
+            conv.append({"role": "assistant", "content": getattr(msg, "content", None) or "",
+                         "tool_calls": [{"id": c.id, "type": "function",
+                                         "function": {"name": c.function.name,
+                                                      "arguments": c.function.arguments}}
+                                        for c in calls]})
+            for c in calls:
+                name = c.function.name
+                try:
+                    args = json.loads(c.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                res = _execute_tool(sess, name, args)
+                tool_log.append({"tool": name, "args": args, "result": res})
+                conv.append({"role": "tool", "tool_call_id": c.id, "name": name,
+                             "content": json.dumps(res, ensure_ascii=False)})
+        self._prune()
+        return {"content": "도구 호출이 계속되어 중단되었습니다.", "tool_log": tool_log}
+
+    def _prune(self) -> None:
+        live = set(SESSIONS)
+        if len(self.chats) > len(live) + 5:
+            self.chats = {k: v for k, v in self.chats.items() if k in live}
 
 
-LLM_AGENT = MockAgent()
+LLM_AGENT = RealAgent()
+
+# ── mock 에이전트 (예전 기본값 · 이제는 비활성) ─────────────────────────────
+# class MockAgent:
+#     # [도메인] booking 서비스명 — SEED_SERVICES 의 booking 이름과 일치해야 함
+#     BOOKING_SERVICE = next((n for n, k in domain.SEED_SERVICES if k == "booking"), "")
+#
+#     def agent_step(self, sess: Session, text: str, history: list) -> dict:
+#         import re
+#         ids = re.search(r"([가-힣]{2,4})\s*(\d{4}-\d{2}-\d{2})", text)
+#         if not sess.verified:
+#             if ids:
+#                 return {"tool_calls": [("verify_customer",
+#                                         {"name": ids.group(1), "birth_date": ids.group(2)})]}
+#             return {"content": "본인 확인을 위해 성함과 생년월일을 말씀해 주세요."}
+#         if "취소" in text:
+#             if sess.meta["did_cancel"]:
+#                 return {"content": "이미 취소되었습니다."}
+#             if sess.meta["last_case_id"]:
+#                 return {"tool_calls": [("cancel_case", {"case_id": sess.meta["last_case_id"]})]}
+#             return {"tool_calls": [("list_cases", {})]}
+#         if ("내일" in text or "모레" in text) and not sess.meta["last_slots"]:
+#             d = "모레" if "모레" in text else "내일"
+#             date_str = (datetime.now().date() + timedelta(days=2 if d == "모레" else 1)).isoformat()
+#             return {"tool_calls": [("get_available_slots",
+#                                     {"service": self.BOOKING_SERVICE, "date": date_str})]}
+#         if any(w in text for w in ("조회", "내 예약", "내 케이스", "보여줘")):
+#             if sess.meta["listed_done"]:
+#                 return {"content": "조회 결과는 이미 안내해 드렸습니다."}
+#             return {"tool_calls": [("list_cases", {})]}
+#         m = re.search(r"(\d{1,2})\s*시", text)
+#         if sess.meta["last_slots"] and not sess.meta["did_open"] and ("해주세요" in text or m):
+#             slot = next((s for s in sess.meta["last_slots"]
+#                          if m and s["time"].startswith(f"{int(m.group(1)):02d}")),
+#                         sess.meta["last_slots"][0])
+#             return {"tool_calls": [("open_case", {"service": self.BOOKING_SERVICE,
+#                                                   "summary": text, "slot_id": slot["slot_id"]})]}
+#         return {"content": "네, 그렇게 도와드릴게요."}
+#
+#
+# LLM_AGENT = MockAgent()
 
 # ── FastAPI 앱 ──
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -340,6 +519,8 @@ def _agent_turn(sess: Session, text: str) -> tuple[str, list]:
                 sess.history.append({"role": "tool",
                                      "content": json.dumps(res, ensure_ascii=False)})
         else:
+            if out.get("tool_log"):   # 실물 에이전트의 도구 로그를 UI 로그로 병합
+                tool_log.extend(out["tool_log"])
             sess.history.append({"role": "assistant", "content": out["content"]})
             return out["content"], tool_log
     return "도구 호출이 계속되어 중단되었습니다.", tool_log
@@ -391,17 +572,29 @@ async def audio_turn(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="audio_too_short")
     tmp = APP_DIR / "tmp_upload.webm"
     tmp.write_bytes(data)
+
+    # [REAL] webm → 16k·mono·wav 변환 (mlx-whisper 입력 규격 — 오디오 계약)
+    wav = APP_DIR / "tmp_upload.wav"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(tmp), "-ar", "16000", "-ac", "1",
+         "-sample_fmt", "s16", str(wav)],
+        check=True, capture_output=True)
+
     t0 = time.time()
-    user_text = ASR.transcribe(tmp)          # [REAL] 로 바꾸면 ffmpeg 변환 + mlx-whisper
+    user_text = ASR.transcribe(wav)          # mlx-whisper (Apple Silicon Metal)
     asr_ms = (time.time() - t0) * 1000
+    if not user_text:   # 환각 필터가 '문구뿐'으로 판정 → 비는 채로 LLM 에 넘기지 않는다
+        raise HTTPException(status_code=400, detail="음성이 인식되지 않았습니다. 다시 말씀해 주세요.")
     answer, tool_log = _agent_turn(sess, user_text)
-    audio, sr = TTS(answer)
+
+    audio, sr = TTS(answer)                  # sherpa-onnx Supertonic(ko)
+    audio = audio_contract.to_16k_mono(audio, sr)   # 계약(16k·mono·f32) 규격화
     buf = io.BytesIO()
     arr = np.asarray(audio, dtype=np.float32)
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
-        w.setframerate(16000)
+        w.setframerate(audio_contract.SR)
         w.writeframes((np.clip(arr, -1, 1) * 32767).astype(np.int16).tobytes())
     audio_b64 = base64.b64encode(buf.getvalue()).decode()
     return {"user_text": user_text, "answer": answer, "audio_b64": audio_b64,
@@ -413,12 +606,12 @@ def index() -> str:
     return (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
 
 
-# ── [REAL · 선택] 엔진 스위치 지점 ─────────────────────────────────────────
-#   실행 중에 다음을 바꾸면 실물 엔진으로 전환된다 (재시작 후 반영):
-#     server.ASR  = RealASR()    # mlx-whisper (ffmpeg 로 webm→16k wav 변환 후 transcribe)
-#     server.TTS  = RealTTS()    # sherpa-onnx Supertonic(ko)
-#     server.LLM_AGENT = RealAgent()  # Ollama qwen + SYSTEM_PROMPT(오늘 날짜 주입)
-#   구체 코드는 GUIDE.md §REAL 전환 을 참고하세요.
+# ── [REAL] 실물 엔진 기본 (mock 은 위에 주석 처리) ─────────────────────────
+#   ASR  : mlx-whisper — AIGC_ASR_MODEL(HF 저장소명), 최초 1회 모델(~1GB) 다운로드
+#   TTS  : sherpa-onnx Supertonic — AIGC_TTS_SUPERTONIC, models/ 에 모델 필요
+#   LLM  : Ollama qwen — AIGC_LLM_MODEL (예: qwen2.5:32b), ollama pull 필요
+#   env  : example-project/.env 에 AIGC_* 를 넣어 두면 로드된다 (python-dotenv)
+#   mock 전환 : 위 ASR/TTS/LLM_AGENT 대입 부분에서 mock 버전으로 바꾸면 됨
 
 if __name__ == "__main__":
     import uvicorn

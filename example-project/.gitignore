@@ -3,6 +3,7 @@
 app/app.db
 guide.db
 app/tmp_upload.webm
+app/tmp_upload.wav
 __pycache__/
 *.pyc
 models/

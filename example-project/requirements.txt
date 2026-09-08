@@ -9,12 +9,16 @@ uvicorn>=0.29
 httpx>=0.27
 python-multipart>=0.0.9     # /api/text-turn · /api/audio-turn 의 Form 파싱
 
-# ── [REAL · 선택] 실물 엔진 (mock 을 먼저 완성한 뒤 연결하세요) ──
+# ── [REAL] 실물 엔진 (기본 — 예제는 REAL 로 동작) ──
 # ASR : Apple Silicon Metal 한국어 전사
-#   pip install mlx-whisper
+mlx-whisper
 # TTS : sherpa-onnx 로컬 한국어 합성 (Supertonic)
-#   pip install sherpa-onnx
-# LLM : Ollama (OpenAI 호환 API) — pip install openai + brew install ollama
-#   openai>=1.30
+#   brew install ffmpeg && (supertonic 모델은 GUIDE §5.3 GitHub release → models/)
+sherpa-onnx
+# LLM : Ollama (OpenAI 호환 API) — brew install ollama && ollama pull qwen2.5:32b
+#   AIGC_* 환경변수는 .env 에 (python-dotenv 로 로드)
+python-dotenv
+openai
+
 # 테스트 오디오 생성: gtts + ffmpeg(brew install ffmpeg)
 #   gTTS>=2.5

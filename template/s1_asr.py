@@ -36,11 +36,25 @@ HALLUCINATION_PATTERNS = [
 
 
 def is_hallucination(text: str, has_audio_speech: bool = True) -> bool:
-    """비었다/발화 없다/자막형 문구 → 환각으로 취급."""
+    """빈 전사·발화 없음·'자막/캡션형 문구'만으로 채워진 출력 → 환각으로 취급.
+
+    캡션 문구('좋아요', '감사합니다', '시청해주셔서') 는 실제 대화에서도
+    '좋아요 그 시간으로 해주세요', '네 감사합니다' 처럼 실발화에 섞여 나온다.
+    부분 일치만으로 전사를 통째로 버리면 실발화를 삼키므로(→ 실물 ASR 이
+    마치 고장난 것처럼 보임), 캡션 문구를 제거한 나머지에 실질 내용이 남아
+    있으면 원문을 그대로 살린다. '문구뿐'인 출력만 환각으로 취급한다.
+    """
     t = (text or "").strip()
     if not t or not has_audio_speech:
         return True
-    return any(p in t for p in HALLUCINATION_PATTERNS)
+    hits = [p for p in HALLUCINATION_PATTERNS if p in t]
+    if len(hits) >= 2:          # 캡션 환각은 '구독+좋아요+감사' 처럼 문구가 겹치는 반면
+        return True             # 실발화에서 캡션 문구가 이렇게 겹쳐 나오는 경우는 없다
+    if not hits:
+        return False
+    residual = re.sub("|".join(re.escape(p) for p in HALLUCINATION_PATTERNS), "", t)
+    residual = re.sub(r"[^A-Za-z0-9가-힣一-鿿]", "", residual)
+    return len(residual) < 4
 
 
 def postprocess_ko(text: str) -> str:
