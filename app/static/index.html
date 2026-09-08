@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>음성 상담 봇 콘솔</title>
+<style>
+  body{background:#1e2430;color:#e8ecf3;font-family:system-ui,sans-serif;max-width:640px;margin:2rem auto;padding:0 1rem}
+  h1{font-size:1.2rem} .card{background:#262d3d;border-radius:10px;padding:1rem;margin:.7rem 0}
+  button{background:#3b82c4;border:0;color:#fff;padding:.55rem 1rem;border-radius:8px;cursor:pointer;font-size:1rem}
+  button:disabled{opacity:.4} input{width:100%;background:#161b26;color:#e8ecf3;border:1px solid #39414f;border-radius:6px;padding:.5rem}
+  .log{font-family:ui-monospace,monospace;font-size:.78rem;color:#9fb3d1;white-space:pre-wrap}
+  #timing{color:#e0c07a;font-size:.78rem}
+  .badge{font-size:.72rem;padding:.15rem .5rem;border-radius:99px;background:#35405a}
+</style></head><body>
+<h1>🎙️ 음성 상담 봇 <span class="badge" id="mode">MOCK</span></h1>
+<div class="card"><button id="rec" onclick="toggleRec()">녹음 시작</button>
+<span id="st"></span>
+<audio id="player" controls style="width:100%;margin-top:.6rem"></audio></div>
+<div class="card"><label>텍스트 대신 입력 (fallback)</label>
+<input id="tx" placeholder="김하나 1985-05-12 로 내일 기사 방문 예약하고 싶어요">
+<button onclick="sendText()">전송</button></div>
+<div class="card"><div class="log" id="log"></div><pre id="timing"></pre></div>
+<script>
+let sid = null, rec = null, chunks = [];
+async function ensure(){ if(sid) return sid;
+  const r = await fetch('/api/session',{method:'POST'}); sid = (await r.json()).session_id; return sid; }
+async function toggleRec(){
+  const b = document.getElementById('rec');
+  if(rec && rec.state==='recording'){
+    rec.stop(); b.textContent='전송 중…'; b.disabled=true;
+    const blob = new Blob(chunks,{type:'audio/webm'}); chunks=[];
+    const fd = new FormData(); fd.append('session_id', await ensure()); fd.append('audio', blob, 'mic.webm');
+    const t0 = performance.now();
+    const r = await fetch('/api/audio-turn',{method:'POST', body:fd});
+    const j = await r.json(); show(j, performance.now()-t0);
+    if(j.audio_b64){ player.src='data:audio/wav;base64,'+j.audio_b64; player.play(); }
+    b.textContent='녹음 시작'; b.disabled=false; return;
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+  rec = new MediaRecorder(stream); chunks=[];
+  rec.ondataavailable = e => chunks.push(e.data);
+  rec.start(); b.textContent='■ 녹음 중… (멈추면 전송)';
+}
+async function sendText(){
+  const fd = new FormData(); fd.append('session_id', await ensure()); fd.append('text', document.getElementById('tx').value);
+  const t0 = performance.now();
+  const r = await fetch('/api/text-turn',{method:'POST', body:fd});
+  const L = document.getElementById('log');
+  if(r.status!==200){ L.innerText += '⚠️ ' + ((await r.json()).detail||'오류') + '\n'; return; }
+  const j = await r.json(); show(j, performance.now()-t0);
+}
+function show(j, ms){ const L=document.getElementById('log');
+  L.innerText += (j.user_text? '🎤 '+j.user_text+'\n' : '') + '💬 '+j.answer+'\n';
+  (j.tools||[]).forEach(t=> L.innerText += '   🔧 '+t.tool+' '+JSON.stringify(t.args)+'\n');
+  document.getElementById('timing').innerText = '⏱ '+Math.round(ms)+'ms  '+JSON.stringify(j.timing_ms||{});
+}
+document.getElementById('tx').addEventListener('keydown', e=>{ if(e.key==='Enter') sendText(); });
+</script></body></html>
