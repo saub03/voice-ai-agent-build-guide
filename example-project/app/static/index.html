@@ -14,7 +14,8 @@
 <h1>🎙️ 음성 상담 봇 <span class="badge" id="mode">MOCK</span></h1>
 <div class="card"><button id="rec" onclick="toggleRec()">녹음 시작</button>
 <span id="st"></span>
-<audio id="player" controls style="width:100%;margin-top:.6rem"></audio></div>
+<audio id="player" controls style="width:100%;margin-top:.6rem"></audio>
+<button id="replay" style="margin-top:.4rem;display:none;background:#2f9e63" onclick="document.getElementById('player').play()">🔊 다시 듣기</button></div>
 <div class="card"><label>텍스트 대신 입력 (fallback)</label>
 <input id="tx" placeholder="김하나 1985-05-12 로 내일 기사 방문 예약하고 싶어요">
 <button onclick="sendText()">전송</button></div>
@@ -23,27 +24,50 @@
 let sid = null, rec = null, chunks = [];
 async function ensure(){ if(sid) return sid;
   const r = await fetch('/api/session',{method:'POST'}); sid = (await r.json()).session_id; return sid; }
+async function uploadAudio(blob){
+  const fd = new FormData(); fd.append('session_id', await ensure()); fd.append('audio', blob, 'mic.webm');
+  const t0 = performance.now();
+  const L = document.getElementById('log');
+  let r = await fetch('/api/audio-turn',{method:'POST', body:fd});
+  if(r.status===404){ sid = null; fd.set('session_id', await ensure()); r = await fetch('/api/audio-turn',{method:'POST', body:fd}); }
+  if(r.status!==200){
+    let detail = r.status+'';
+    try{ detail = (await r.json()).detail || r.status; }catch(e){}
+    L.innerText += '⚠️ ' + detail + '\n';
+    document.getElementById('timing').innerText = '⏱ '+Math.round(performance.now()-t0)+'ms  {}';
+    return;
+  }
+  const j = await r.json(); show(j, performance.now()-t0);
+  if(j.audio_b64){
+    player.src='data:audio/wav;base64,'+j.audio_b64;
+    player.play().catch(()=>{              // 자동재생 차단 시 '다시 듣기' 버튼 노출
+      document.getElementById('replay').style.display='inline-block';
+    });
+  }
+}
 async function toggleRec(){
   const b = document.getElementById('rec');
   if(rec && rec.state==='recording'){
-    rec.stop(); b.textContent='전송 중…'; b.disabled=true;
+    b.textContent='전송 중…'; b.disabled=true;
+    const stopped = new Promise(res => rec.onstop = res);
+    rec.stop();
+    await stopped;                                  // dataavailable 완료 후 blob 생성 (음성 누락 방지)
     const blob = new Blob(chunks,{type:'audio/webm'}); chunks=[];
-    const fd = new FormData(); fd.append('session_id', await ensure()); fd.append('audio', blob, 'mic.webm');
-    const t0 = performance.now();
-    const r = await fetch('/api/audio-turn',{method:'POST', body:fd});
-    const j = await r.json(); show(j, performance.now()-t0);
-    if(j.audio_b64){ player.src='data:audio/wav;base64,'+j.audio_b64; player.play(); }
+    const stream = rec.stream;
+    await uploadAudio(blob);
+    stream.getTracks().forEach(t=>t.stop());        // 마이크 해제
     b.textContent='녹음 시작'; b.disabled=false; return;
   }
   const stream = await navigator.mediaDevices.getUserMedia({audio:true});
   rec = new MediaRecorder(stream); chunks=[];
-  rec.ondataavailable = e => chunks.push(e.data);
+  rec.ondataavailable = e => { if(e.data && e.data.size) chunks.push(e.data); };
   rec.start(); b.textContent='■ 녹음 중… (멈추면 전송)';
 }
 async function sendText(){
   const fd = new FormData(); fd.append('session_id', await ensure()); fd.append('text', document.getElementById('tx').value);
   const t0 = performance.now();
-  const r = await fetch('/api/text-turn',{method:'POST', body:fd});
+  let r = await fetch('/api/text-turn',{method:'POST', body:fd});
+  if(r.status===404){ sid = null; fd.set('session_id', await ensure()); r = await fetch('/api/text-turn',{method:'POST', body:fd}); }
   const L = document.getElementById('log');
   if(r.status!==200){ L.innerText += '⚠️ ' + ((await r.json()).detail||'오류') + '\n'; return; }
   const j = await r.json(); show(j, performance.now()-t0);

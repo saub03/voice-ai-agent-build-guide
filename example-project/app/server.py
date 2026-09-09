@@ -15,6 +15,7 @@ import base64
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess  # (실물 ASR: webm → 16k mono wav 변환용)
 import threading
@@ -240,10 +241,17 @@ def _services(sess: Session) -> dict:
     return {"services": names}
 
 
+def _svc(sess: Session, name: str) -> sqlite3.Row | None:
+    """서비스명 조회 — LLM 이 '기사 방문(예약)' 처럼 괄호 표기를 붙여도 순수 이름으로 찾는다.
+    호출측이 DB_LOCK 을 보유하고 있다고 가정한다."""
+    base = re.sub(r"[\(（][^)）]*[)）]", "", name or "").strip()
+    return _db().execute("SELECT * FROM services WHERE name=?", (base,)).fetchone()
+
+
 def _slots(sess: Session, service: str, date: str) -> dict:
     conn = _db()
     with DB_LOCK:
-        s = conn.execute("SELECT * FROM services WHERE name=?", (service,)).fetchone()
+        s = _svc(sess, service)
         if s is None:
             return {"ok": False, "message": "없는 서비스입니다.", "reason": "no_service"}
         rows = [dict(r) for r in conn.execute(
@@ -263,7 +271,7 @@ def _open(sess: Session, service: str, summary: str, slot_id: int | None = None,
         return {"ok": False, "reason": "not_verified"}
     conn = _db()
     with DB_LOCK:
-        s = conn.execute("SELECT * FROM services WHERE name=?", (service,)).fetchone()
+        s = _svc(sess, service)
         if s is None:
             return {"ok": False, "message": "없는 서비스입니다.", "reason": "no_service"}
         open_cnt = conn.execute(
@@ -350,6 +358,104 @@ def _execute_tool(sess: Session, name: str, args: dict) -> dict:
         return {"error": "bad_arguments", "message": f"{type(e).__name__}: {e}"}
 
 
+# ── 고객 확인: ASR 텍스트에서 이름+생년월일을 '결정적으로' 추출 ────────────
+#   기존(LLM tool-calling)은 구어 생년월일('천구백팔십오년 오월 십이일' 등)의 숫자화에
+#   실패할 때가 있어, 음성 전사에서 바로 추출해 _verify 로 검증한다.
+_KOR_TOKENS = re.compile(r"(?:하나|둘|셋|넷|다섯|여섯|일곱|여덟|아홉|공|영|일|이|삼|사|오|육|칠|팔|구|십|백|천)")
+_KOR_DIGIT = {"공": "0", "영": "0", "일": "1", "이": "2", "삼": "3", "사": "4", "오": "5", "육": "6",
+              "칠": "7", "팔": "8", "구": "9", "하나": "1", "둘": "2", "셋": "3", "넷": "4", "다섯": "5",
+              "여섯": "6", "일곱": "7", "여덟": "8", "아홉": "9"}
+_KOR_UNIT = {"십": 10, "백": 100, "천": 1000}
+
+
+def _kor_num(value: str) -> int | None:
+    """한글 숫자 토큰 → 정수. 예: 일구팔오=1985 · 천구백팔십오=1985 · 오=5 · 십이=12."""
+    toks = _KOR_TOKENS.findall(value)
+    if not toks or "".join(toks) != value.replace(" ", ""):
+        return None
+    if any(t in _KOR_UNIT for t in toks):            # 복합 읽기 (십/백/천 포함)
+        total, cur = 0, 0
+        for t in toks:
+            if t in _KOR_UNIT:
+                total += (cur or 1) * _KOR_UNIT[t]
+                cur = 0
+            else:
+                cur = int(_KOR_DIGIT[t])
+        return total + cur
+    if len(toks) == 1:                                # 단독 숫자 읽기
+        return int(_KOR_DIGIT[toks[0]])
+    return int("".join(_KOR_DIGIT[t] for t in toks))  # 병기 읽기 (일구팔오 → 1985)
+
+
+def _spoken_date_to_digits(text: str) -> str:
+    """한글 숫자로 쓰인 날짜 구('천구백팔십오년 오월 십이일')를 숫자형('1985년 5월 12일')으로."""
+    out = text
+    for anchor in ("년", "월", "일"):
+        pat = re.compile(r"(" + _KOR_TOKENS.pattern + r"+)\s*" + anchor)
+
+        def _repl(m, _a=anchor) -> str:
+            v = _kor_num(m.group(1))
+            return f"{v}{_a}" if v is not None else m.group(0)
+
+        out = pat.sub(_repl, out)
+    return out
+
+
+def _birth_fmt(y: str, mo: str, d: str) -> str | None:
+    y, mo, d = int(y), int(mo), int(d)
+    if y < 100:                          # 2자리 연도 → 1950~2049 관례
+        y = 1900 + y if y >= 50 else 2000 + y
+    if not (1900 <= y <= 2100) or not (1 <= mo <= 12) or not (1 <= d <= 31):
+        return None
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def _extract_birth_date(text: str, near: int | None = None) -> str | None:
+    """전사 텍스트에서 생년월일(YYYY-MM-DD)을 추출. near 는 이름 위치 — 가장 가까운 날짜 선택."""
+    t = _spoken_date_to_digits(text)
+    pats = (
+        re.compile(r"(?P<y>\d{4})\s*(?:년|[-/.])\s*(?P<m>\d{1,2})\s*(?:월|[-/.])\s*(?P<d>\d{1,2})(?:일)?"),
+        re.compile(r"(?P<y>\d{2})\s*년\s*(?P<m>\d{1,2})\s*월\s*(?P<d>\d{1,2})(?:일)?"),
+        re.compile(r"(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})"),          # YYYYMMDD
+    )
+    best, best_d = None, None
+    for pat in pats:
+        for m in pat.finditer(t):
+            cand = _birth_fmt(m.group("y"), m.group("m"), m.group("d"))
+            if cand is None:
+                continue
+            d = abs(m.start() - (near if near is not None else 0))
+            if best_d is None or d < best_d:
+                best_d, best = d, cand
+    return best
+
+
+def _extract_identity(text: str) -> tuple[str, str] | None:
+    """전사 텍스트에서 (이름, 생년월일) 결정적 추출. 실패 시 None (LLM 경로로 폴백)."""
+    for name, _bd in domain.SEED_CUSTOMERS:
+        idx = text.find(name)
+        if idx >= 0:
+            birth_date = _extract_birth_date(text, near=idx)
+            if birth_date:
+                return name, birth_date
+    return None
+
+
+def _auto_verify(sess: Session, text: str) -> dict | None:
+    """미확인 세션에서 전사 텍스트로 곧바로 본인확인. 도구 로그 형식과 동일하게 반환.
+    DB 일치(ok)일 때만 주입 — 잘못 추출됐을 땐 None 이 되어 LLM 경로로 폴백한다."""
+    if sess.verified:
+        return None
+    ident = _extract_identity(text)
+    if ident is None:
+        return None
+    name, birth_date = ident
+    res = _verify(sess, name, birth_date)
+    if not res.get("ok"):
+        return None
+    return {"tool": "verify_customer", "args": {"name": name, "birth_date": birth_date}, "result": res}
+
+
 # ── 실물 에이전트 — Ollama qwen (OpenAI 호환 API) ────────────────────────────
 #   도구 루프는 GUIDE §5.4 주의사항대로 'auto + 왕복 루프'로 자체 수행한다.
 #   - SYSTEM_PROMPT 에 '오늘 날짜'를 반드시 주입 (날짜 환각 방지, GUIDE T2)
@@ -399,14 +505,15 @@ class RealAgent:
             "AIGC_LLM_BASE_URL", "http://localhost:11434/v1"), api_key="ollama")
         self.chats: dict[str, list[dict]] = {}
         today = datetime.now().date().isoformat()
-        catalog = " · ".join(f"{n}({('예약' if k == 'booking' else '접수')})"
-                             for n, k in domain.SEED_SERVICES)
+        catalog = " · ".join(n for n, _k in domain.SEED_SERVICES)
         self.system = (
             "당신은 택배/배송 고객상담센터의 음성 상담원입니다. "
             f"오늘 날짜는 {today} 입니다. 날짜는 반드시 이 값만 사용하세요.\n"
             f"서비스 카탈로그(정확한 이름만 사용): {catalog}\n"
             "규칙:\n"
-            "1) verify_customer(이름+생년월일) 로 본인 확인을 먼저 한 뒤 업무를 진행한다.\n"
+            "1) verify_customer(이름+생년월일) 로 본인 확인을 먼저 한 뒤 업무를 진행한다. "
+            "생년월일은 반드시 YYYY-MM-DD 숫자 형식으로 변환해 birth_date 에 넣는다. "
+            "예: '일구팔오년 오월 십이일', '천구백팔십오년 오월 십이일', '1985년 5월 12일' → 1985-05-12\n"
             "2) 예약(booking)은 get_available_slots(service, date) 로 슬롯을 조회하고, "
             "고객이 고른 시간의 slot_id 로 open_case(service, summary, slot_id)를 연다.\n"
             "3) 조회는 list_cases, 취소는 cancel_case(case_id) 를 쓴다.\n"
@@ -420,6 +527,16 @@ class RealAgent:
         conv = self.chats.setdefault(sid, [{"role": "system", "content": self.system}])
         conv.append({"role": "user", "content": text})
         tool_log: list[dict] = []
+        auto = _auto_verify(sess, text)          # ASR 텍스트에서 결정적 본인확인 (LLM 불필요)
+        if auto is not None:
+            tool_log.append(auto)
+            cid = f"auto_{len(conv)}"
+            conv.append({"role": "assistant", "content": "",
+                         "tool_calls": [{"id": cid, "type": "function",
+                                         "function": {"name": "verify_customer",
+                                                      "arguments": json.dumps(auto["args"], ensure_ascii=False)}}]})
+            conv.append({"role": "tool", "tool_call_id": cid, "name": "verify_customer",
+                         "content": json.dumps(auto["result"], ensure_ascii=False)})
         for _ in range(self.MAX_TOOL_TURNS):
             r = self.client.chat.completions.create(
                 model=self.model, messages=conv, tools=_tool_schemas(), temperature=0.0)
@@ -526,6 +643,21 @@ def _agent_turn(sess: Session, text: str) -> tuple[str, list]:
     return "도구 호출이 계속되어 중단되었습니다.", tool_log
 
 
+def _tts_reply(text: str) -> dict:
+    """LLM 없이 고정 문구를 TTS 로만 응답 — 인식 실패 재안내용 (항상 소리+문구 반환)."""
+    audio, sr = TTS(text)
+    audio = audio_contract.to_16k_mono(audio, sr)
+    buf = io.BytesIO()
+    arr = np.asarray(audio, dtype=np.float32)
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(audio_contract.SR)
+        w.writeframes((np.clip(arr, -1, 1) * 32767).astype(np.int16).tobytes())
+    return {"user_text": "", "answer": text, "audio_b64": base64.b64encode(buf.getvalue()).decode(),
+            "tools": [], "timing_ms": {}}
+
+
 @app.on_event("startup")
 def _init_db() -> None:
     reset_db_state()
@@ -569,7 +701,7 @@ async def audio_turn(request: Request) -> dict:
     file = form.get("audio")
     data = await file.read() if file else None
     if not data or len(data) < 2000:
-        raise HTTPException(status_code=400, detail="audio_too_short")
+        return _tts_reply("녹음이 너무 짧았어요. 조금 더 길게 다시 말씀해 주세요.")
     tmp = APP_DIR / "tmp_upload.webm"
     tmp.write_bytes(data)
 
@@ -583,10 +715,14 @@ async def audio_turn(request: Request) -> dict:
     t0 = time.time()
     user_text = ASR.transcribe(wav)          # mlx-whisper (Apple Silicon Metal)
     asr_ms = (time.time() - t0) * 1000
-    if not user_text:   # 환각 필터가 '문구뿐'으로 판정 → 비는 채로 LLM 에 넘기지 않는다
-        raise HTTPException(status_code=400, detail="음성이 인식되지 않았습니다. 다시 말씀해 주세요.")
-    answer, tool_log = _agent_turn(sess, user_text)
+    if not user_text:   # 환각 필터가 '문구뿐'으로 판정 → LLM 대신 재안내 (400 으로 끊지 않는다)
+        return _tts_reply("다시 한 번 말씀해 주시겠어요?")
 
+    t0 = time.time()
+    answer, tool_log = _agent_turn(sess, user_text)
+    llm_ms = (time.time() - t0) * 1000
+
+    t0 = time.time()
     audio, sr = TTS(answer)                  # sherpa-onnx Supertonic(ko)
     audio = audio_contract.to_16k_mono(audio, sr)   # 계약(16k·mono·f32) 규격화
     buf = io.BytesIO()
@@ -596,9 +732,11 @@ async def audio_turn(request: Request) -> dict:
         w.setsampwidth(2)
         w.setframerate(audio_contract.SR)
         w.writeframes((np.clip(arr, -1, 1) * 32767).astype(np.int16).tobytes())
+    tts_ms = (time.time() - t0) * 1000
     audio_b64 = base64.b64encode(buf.getvalue()).decode()
     return {"user_text": user_text, "answer": answer, "audio_b64": audio_b64,
-            "tools": tool_log, "timing_ms": {"asr": round(asr_ms), "llm": 0, "tts": 0}}
+            "tools": tool_log,
+            "timing_ms": {"asr": round(asr_ms), "llm": round(llm_ms), "tts": round(tts_ms)}}
 
 
 @app.get("/", response_class=HTMLResponse)
